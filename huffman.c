@@ -4,8 +4,10 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <string.h>
+#include <pthread.h>
 
 #define MAX_CHAR 256
+#define BUFFER_SIZE 8192
 
 typedef struct HuffmanNode
 {
@@ -203,6 +205,24 @@ void flushBuffer(int fd, BitBuffer *buffer)
     }
 }
 
+typedef struct
+{
+    unsigned char *data;
+    off_t start;
+    off_t end;
+    unsigned int *freq;
+} ThreadData;
+
+void *countFrequency(void *arg)
+{
+    ThreadData *td = (ThreadData *)arg;
+    for (off_t i = td->start; i < td->end; i++)
+    {
+        __sync_fetch_and_add(&td->freq[td->data[i]], 1);
+    }
+    return NULL;
+}
+
 void encrypt(const char *inputFile, const char *outputFile)
 {
     int in_fd = open(inputFile, O_RDONLY);
@@ -224,9 +244,23 @@ void encrypt(const char *inputFile, const char *outputFile)
     }
 
     unsigned int freq[MAX_CHAR] = {0};
-    for (off_t i = 0; i < in_size; i++)
+    int num_threads = 4;
+    pthread_t threads[num_threads];
+    ThreadData td[num_threads];
+
+    off_t chunk_size = in_size / num_threads;
+    for (int i = 0; i < num_threads; i++)
     {
-        freq[in_data[i]]++;
+        td[i].data = in_data;
+        td[i].start = i * chunk_size;
+        td[i].end = (i == num_threads - 1) ? in_size : (i + 1) * chunk_size;
+        td[i].freq = freq;
+        pthread_create(&threads[i], NULL, countFrequency, &td[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
     }
 
     HuffmanNode *root = buildHuffmanTree(freq);
@@ -272,15 +306,42 @@ void encrypt(const char *inputFile, const char *outputFile)
 
     // Write encrypted data
     BitBuffer buffer = {0, 0};
+    unsigned char out_buffer[BUFFER_SIZE];
+    size_t out_index = 0;
+
     for (off_t i = 0; i < in_size; i++)
     {
         char *code = ht.codes[in_data[i]];
         for (int j = 0; code[j]; j++)
         {
-            writeBit(out_fd, &buffer, code[j] - '0');
+            buffer.byte = (buffer.byte << 1) | (code[j] - '0');
+            buffer.bit_count++;
+
+            if (buffer.bit_count == 8)
+            {
+                out_buffer[out_index++] = buffer.byte;
+                buffer.bit_count = 0;
+                buffer.byte = 0;
+
+                if (out_index == BUFFER_SIZE)
+                {
+                    write(out_fd, out_buffer, BUFFER_SIZE);
+                    out_index = 0;
+                }
+            }
         }
     }
-    flushBuffer(out_fd, &buffer);
+
+    if (buffer.bit_count > 0)
+    {
+        buffer.byte <<= (8 - buffer.bit_count);
+        out_buffer[out_index++] = buffer.byte;
+    }
+
+    if (out_index > 0)
+    {
+        write(out_fd, out_buffer, out_index);
+    }
 
     freeTree(root);
     munmap(in_data, in_size);
